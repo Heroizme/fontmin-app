@@ -1,0 +1,118 @@
+name: 🚀 Deploy GitHub Pages from Release ZIP
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to deploy (e.g. 1.0.0). Use "latest" for the most recent.'
+        required: false
+        default: 'latest'
+      asset:
+        description: 'The ZIP asset name to download (e.g. WebGL_Demo.zip)'
+        required: false
+        default: 'WebGL_Demo.zip'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: "pages"
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Determine release tag
+        id: get_tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            # Release 触发：直接取发布事件的 tag
+            TAG="${{ github.event.release.tag_name }}"
+            echo "Triggered by release → using tag $TAG"
+          else
+            # 手动触发：根据输入决定
+            INPUT_TAG="${{ github.event.inputs.tag }}"
+            if [ -z "$INPUT_TAG" ] || [ "$INPUT_TAG" = "latest" ]; then
+              echo "Fetching latest release tag..."
+              TAG=$(gh release list \
+                --repo "${GITHUB_REPOSITORY}" \
+                --limit 1 \
+                --json tagName \
+                --jq '.[0].tagName')
+              echo "Latest release is $TAG"
+            else
+              TAG="$INPUT_TAG"
+              echo "Using manually specified tag $TAG"
+            fi
+          fi
+
+          if [ -z "$TAG" ]; then
+            echo "::error ::Could not determine a release tag."
+            exit 1
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Determine asset name
+        id: get_asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            # Release 触发：列出所有 assets，默认取第一个 zip
+            ASSET_NAME=$(gh release view "${{ steps.get_tag.outputs.tag }}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets \
+              --jq '.assets[].name' \
+              | grep '\.zip$' \
+              | head -n1)
+            echo "Release trigger → picking first ZIP asset: $ASSET_NAME"
+          else
+            # 手动触发：使用用户输入的 asset 名
+            ASSET_NAME="${{ github.event.inputs.asset }}"
+            echo "Manual trigger → using asset name: $ASSET_NAME"
+          fi
+
+          if [ -z "$ASSET_NAME" ]; then
+            echo "::error ::Could not determine asset name."
+            exit 1
+          fi
+          echo "asset_name=$ASSET_NAME" >> $GITHUB_OUTPUT
+
+      - name: Download ZIP via gh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p releases
+          gh release download "${{ steps.get_tag.outputs.tag }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${{ steps.get_asset.outputs.asset_name }}" \
+            --dir releases
+
+      - name: Extract site content
+        run: |
+          mkdir output
+          unzip -q "releases/${{ steps.get_asset.outputs.asset_name }}" -d output
+
+      - name: Disable Jekyll processing
+        run: echo '' > output/.nojekyll
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: output
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
